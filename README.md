@@ -9,3 +9,6 @@ R(x) \;=\;
 $$
 
 as the nonlinear activation function in our neural network.
+
+rational.py and experiment_1d.py are for rational NN;
+rational_baryrat.py and experiment_baryrat.py are for baryrat NN
