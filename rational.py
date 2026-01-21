@@ -9,7 +9,7 @@ class Rational(torch.nn.Module):
     """Rational Activation function.
     It follows:
     `f(x) = P(x) / Q(x),
-    where the coefficients of P and Q are initialized to the best rational 
+    where the coefficients of P and Q are initialized to the best rational
     approximation of degree (3,2) to the ReLU function
     # Reference
         - [Rational neural networks](https://arxiv.org/abs/2004.01902)
