@@ -1,69 +1,163 @@
 import torch
 
 
-
-def get_network(args, degree, x_support):
+def get_network(args, degree, x_support, num_units=None):
+    """
+    num_units: 激活层作用的“通道数/神经元数”，例如 fc1 输出 50 就传 50。
+    - 如果 num_units is None：退化到旧行为（每层共享一组 theta，形状 (degree+1,)）
+    - 如果 num_units is not None：每个神经元一组 theta，形状 (num_units, degree+1)
+    """
     if args.network == 'rational_baryrat':
-        model = Rational_baryrat(degree=degree, x_support=x_support)
+        model = Rational_baryrat(degree=degree, x_support=x_support, num_units=num_units)
     elif args.network == 'rational':
         model = Rational()
     return model
 
 
 class Rational_baryrat(torch.nn.Module):
-    def __init__(self, degree, x_support, epsilon=1e-2):
-        super().__init__()  # Initialize base nn.Module class
-        self.degree = degree  # Number of support points (i.e., basis terms)
-        self.epsilon = epsilon  # Minimum magnitude to avoid coeffs_w near zero
-        self.coeffs_w_raw = torch.nn.Parameter(torch.empty(degree))
-        # Raw trainable parameters that will be reparameterized to avoid zero
+    """
+    按 PDF 写法：
+        w_j = 1 / Π_{k!=j} (x_j - x_k)
+        σ(x) = Σ_j (w_j * θ_j / (x - x_j)) / Σ_j (w_j / (x - x_j))
 
-        self.coeffs_phi = torch.nn.Parameter(torch.empty(degree))
-        # Multiplicative coefficients (typically act as the "signal" weights)
+    关键改动：
+    1) w_j 严格跟随 PDF product 公式计算（log-space 稳定版）。
+    2) 每个神经元函数的可学习参数 θ_j 不同：theta 参数为 (num_units, degree+1)。
+       - input 形状 [B, num_units] 时，逐元素每个通道用自己的 θ。
+       - 若 num_units=None，则退化到共享一组 θ（兼容旧用法）。
+    3) 假设“每层 50 个神经元用同一组 Chebyshev 节点”，因此 x_support 应传 1D: (degree+1,)。
+       若你传的是 (degree+1, dim)，这里会自动取第 0 维列（等价于共享 1D 节点）。
+    """
+    def __init__(self, degree, x_support, num_units=None, epsilon1=0.01):
+        super().__init__()
+        self.degree = degree
+        self.epsilon1 = epsilon1
+        self.num_units = num_units  # None => shared theta, else per-unit theta
 
-        self.reset_parameters()  # Initialize weights
-        self.x_support = x_support  # Anchor points (fixed) that define rational basis locations
+        # ---- normalize x_support to 1D (degree+1,) ----
+        x_support = torch.as_tensor(x_support)
+        if x_support.dim() == 2:
+            # 你现在的 x_support 可能是 (degree+1, dim)；按“每个神经元用同一组点”取一列即可
+            x_support = x_support[:, 0]
+        x_support = x_support.reshape(-1)
+        assert x_support.numel() == degree + 1, f"x_support must have {degree+1} nodes, got {x_support.numel()}"
+
+        # 固定节点（不训练）
+        self.register_buffer("x_support", x_support)
+
+        # ---- compute barycentric weights w_j by PDF definition ----
+        w = self._compute_barycentric_weights_pdf(self.x_support)
+        self.register_buffer("coeffs_w", w)  # 固定 w_j（不训练），避免每次 forward 重算
+
+        # ---- learnable theta (coeffs_phi_raw) ----
+        if self.num_units is None:
+            self.coeffs_phi_raw = torch.nn.Parameter(torch.empty(degree + 1, dtype=x_support.dtype, device=x_support.device))
+        else:
+            self.coeffs_phi_raw = torch.nn.Parameter(torch.empty(self.num_units, degree + 1, dtype=x_support.dtype, device=x_support.device))
+
+        self.reset_parameters()
 
     def reset_parameters(self):
-        self.coeffs_w_raw.data = torch.randn(self.degree) * 0.1
-        # Initialize raw weights with small values around 0 to ensure stability after reparameterization
+        # 每个神经元独立初始化（如果是矩阵，torch.rand 会给每个元素独立随机）
+        with torch.no_grad():
+            self.coeffs_phi_raw.copy_(torch.rand_like(self.coeffs_phi_raw) * 0.1)
 
-        self.coeffs_phi.data = torch.rand(self.degree)
-        # Initialize phi coefficients with uniform random values in [0, 1)
+    @staticmethod
+    def _compute_barycentric_weights_pdf(x_support_1d: torch.Tensor) -> torch.Tensor:
+        """
+        w_j = 1 / prod_{k!=j} (x_j - x_k)
+        使用 log-abs + sign 来减少 under/overflow 风险。
+        """
+        x = x_support_1d.reshape(-1)
+        n = x.numel()
+
+        # diff[j,k] = x[j] - x[k]
+        diff = x.unsqueeze(1) - x.unsqueeze(0)  # (n,n)
+
+        # mask diagonal so it doesn't affect product/sum
+        eye = torch.eye(n, dtype=torch.bool, device=x.device)
+        diff_no_diag = diff.masked_fill(eye, 1.0)
+
+        # sign and log(abs)
+        sign = torch.sign(diff_no_diag).prod(dim=1)           # (n,)
+        log_abs = torch.log(torch.abs(diff_no_diag)).sum(dim=1)  # (n,)
+
+        w = sign * torch.exp(-log_abs)  # (n,)
+        return w
 
     def get_coeffs_w(self):
-        # Reparameterize coeffs_w_raw to avoid values near zero but still allow negative and positive values
-        # Formula: sign(x) * (ε + |x|), so it's always outside (-ε, ε) and preserves sign
-        return torch.sign(self.coeffs_w_raw) * (self.epsilon + torch.abs(self.coeffs_w_raw))
+        # 已经预先算好并 register_buffer 了
+        return self.coeffs_w
+
+    def get_coeffs_phi(self):
+        return self.coeffs_phi_raw
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        coeffs_w = self.get_coeffs_w()  # Apply reparameterization to obtain usable coeffs_w
-        coeffs_num = coeffs_w * self.coeffs_phi  # Numerator coefficients (element-wise)
-        coeffs_den = coeffs_w  # Denominator uses coeffs_w directly
-        coeffs = torch.stack((coeffs_num, coeffs_den), dim=0)
-        # Stack into a [2, degree] tensor where 0th row = numerator, 1st row = denominator
+        """
+        input:
+          - 若 num_units=None: 形状 [B, D] 或任意 (..., D)，共享一套 θ（对所有通道相同）
+          - 若 num_units=U:   形状 [B, U] 或任意 (..., U)，每个通道用自己的 θ_u
+        返回与 input 同 shape。
+        """
+        w = self.get_coeffs_w()           # (N,)
+        theta = self.get_coeffs_phi()     # (N,) or (U,N)
+        xj = self.x_support               # (N,)
 
-        input_dim1 = input.shape[1]  # Input feature dimension (e.g., 1 for scalar input)
-        input_dim2 = self.x_support.shape[1]  # x_support feature dimension (should match input)
-        assert input_dim1 % input_dim2 == 0  # Ensure dimensions are compatible for broadcasting
-        repeat_factor = input_dim1 // input_dim2  # How many times to repeat support to match input
+        eps = torch.tensor(1e-8, dtype=input.dtype, device=input.device)
 
-        x_expand = input.unsqueeze(1)  # Shape: [batch_size, 1, input_dim]
-        x_support_expand = self.x_support.unsqueeze(0).repeat(1, 1, repeat_factor)
-        # Shape: [1, degree, input_dim], repeated to match input batch
+        if self.num_units is None:
+            # ---- shared theta: theta (N,) ----
+            # diff: (..., N)
+            diff = input.unsqueeze(-1) - xj
+            exact = diff == 0
 
-        X = x_expand - x_support_expand + 1  # Difference between input and support points
-        X = 1.0 / X  # Invert to compute rational basis terms (1 / (x - x_i))
+            diff_safe = torch.where(exact, torch.ones_like(diff), diff)
+            inv = 1.0 / diff_safe
 
-        PQ = torch.einsum('ed,bdw->ebw', coeffs, X)
-        # Einstein summation to compute weighted sum of basis terms
-        # Output: [2, batch_size, input_dim]
+            # num/den: (...)
+            num = torch.sum(w * theta * inv, dim=-1)
+            den = torch.sum(w * inv, dim=-1)
+            out = num / (den + 0.0)
 
-        output = torch.div(PQ[0, ...], PQ[1, ...])
-        # Compute element-wise division (numerator / denominator), shape: [batch_size, input_dim]
-        return output
+            # exact hit -> out = theta[j]
+            if exact.any():
+                j_idx = exact.to(torch.int64).argmax(dim=-1)  # (...)
+                out_exact = theta[j_idx]
+                out = torch.where(exact.any(dim=-1), out_exact, out)
 
+            return out
 
+        else:
+            # ---- per-unit theta: theta (U, N) ----
+            U = self.num_units
+            if input.shape[-1] != U:
+                raise ValueError(f"Rational_baryrat expected input last dim = {U}, got {input.shape[-1]}")
+
+            # diff: (..., U, N)
+            diff = input.unsqueeze(-1) - xj  # broadcast xj to last dim
+            exact = diff == 0
+
+            diff_safe = torch.where(exact, torch.ones_like(diff), diff)
+            inv = 1.0 / diff_safe
+
+            # reshape w and theta for broadcasting
+            # w_:     (..., 1, N)
+            # theta_: (..., U, N)
+            w_ = w.view(*([1] * (input.dim() - 1)), 1, -1).to(dtype=input.dtype, device=input.device)
+            theta_ = theta.view(*([1] * (input.dim() - 1)), U, -1).to(dtype=input.dtype, device=input.device)
+
+            # num/den: (..., U)
+            num = torch.sum(w_ * theta_ * inv, dim=-1)
+            den = torch.sum(w_ * inv, dim=-1)
+            out = num / (den + 0.0)
+
+            # exact hit: out[..., u] = theta[u, j]
+            if exact.any():
+                j_idx = exact.to(torch.int64).argmax(dim=-1)  # (..., U)
+                theta_pick = torch.gather(theta_, dim=-1, index=j_idx.unsqueeze(-1)).squeeze(-1)  # (..., U)
+                out = torch.where(exact.any(dim=-1), theta_pick, out)
+
+            return out
 
 
 class Rational(torch.nn.Module):
