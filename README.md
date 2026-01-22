@@ -4,8 +4,8 @@ We consider neural networks with **barycentric rational activation functions**. 
 
 $$
 R(x) \;=\;
-\frac{\displaystyle\sum_{j=0}^n \frac{w_j\ \theta_j}{\,x - x_j\,}}
-     {\displaystyle\sum_{j=0}^n \frac{w_j}{\,x - x_j\,}}
+\frac{\displaystyle\sum_{j=0}^n \frac{w_j\ \theta_j}{x - x_j}}
+     {\displaystyle\sum_{j=0}^n \frac{w_j}{x - x_j}}
 $$
 
 as the nonlinear activation function in our neural network.
