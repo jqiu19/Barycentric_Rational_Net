@@ -203,3 +203,4 @@ if __name__ == '__main__':
     plt.show()
 
     print("Avg time per epoch:", sum(T) / len(T))
+
